@@ -1,13 +1,10 @@
 package com.yourcompany.intellirefer.service;
 
 import com.yourcompany.intellirefer.dto.LLMResponse;
-import com.yourcompany.intellirefer.entity.EmployeeProfile;
-import com.yourcompany.intellirefer.entity.JobDescription;
-import com.yourcompany.intellirefer.entity.Referral;
+import com.yourcompany.intellirefer.entity.*;
+import com.yourcompany.intellirefer.event.JdUploadedEvent;
 import com.yourcompany.intellirefer.model.enums.AvailabilityStatus;
-import com.yourcompany.intellirefer.repository.EmployeeProfileRepository;
-import com.yourcompany.intellirefer.repository.JobDescriptionRepository;
-import com.yourcompany.intellirefer.repository.ReferralRepository;
+import com.yourcompany.intellirefer.repository.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -15,7 +12,8 @@ import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
-import org.springframework.util.StringUtils;
+import org.springframework.transaction.event.TransactionPhase;
+import org.springframework.transaction.event.TransactionalEventListener;
 
 import java.io.InputStream;
 import java.time.LocalDate;
@@ -33,35 +31,44 @@ public class MatchingService {
     @Autowired private LLMService llmService;
 
     /**
-     * The main entry point for the asynchronous matching process.
-     * It orchestrates the extraction of JD requirements and then calls the
-     * employee matching logic.
-     * @param jdId The ID of the JobDescription to process.
+     * This method listens for a JdUploadedEvent.
+     * It is triggered automatically AFTER the transaction that published the event has
+     * successfully committed, ensuring the JobDescription is visible in the database.
+     * It runs asynchronously on a background thread.
+     *
+     * @param event The event containing the ID of the newly created Job Description.
      */
     @Async
-    @Transactional
-    public void processJdMatching(Long jdId) {
-        logger.info("============== [MATCHING START] for JD ID: {} ==============", jdId);
+    @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
+    public void handleJdUploadedEvent(JdUploadedEvent event) {
+        Long jdId = event.getJobDescriptionId();
+
+        logger.info("============== [MATCHING START from Event] for JD ID: {} ==============", jdId);
+
+        // This findById call is now safe and will find the JD.
         JobDescription jd = jdRepository.findById(jdId)
-                .orElseThrow(() -> new RuntimeException("JobDescription not found in async task: " + jdId));
+                .orElseThrow(() -> new RuntimeException("JobDescription not found in event listener even after commit: " + jdId));
 
         try (InputStream jdStream = fileSystemStorageService.loadAsResource(jd.getJdFilePath()).getInputStream()) {
             String jdText = parsingService.parse(jdStream, getFileExtension(jd.getJdFilePath()));
 
-            // Step 1: Extract required experience from the JD using the LLM and save it.
+            // Step 1: Extract required experience from the JD and save it.
             llmService.extractExperienceFromJd(jdText).subscribe(
                     jdResponse -> {
                         Integer requiredExp = jdResponse.requiredExperience() != null ? jdResponse.requiredExperience() : 0;
                         logger.info("LLM extracted required experience for JD ID {}: {} years.", jd.getId(), requiredExp);
-                        jd.setRequiredExperience(requiredExp);
-                        jdRepository.save(jd);
 
-                        // Step 2: Now that we have the required experience, match employees.
-                        matchEmployeesAgainstJd(jd, jdText);
+                        // Since we're in a new transaction, we need to save the updated JD.
+                        // To do this safely within a reactive chain, we can fetch it again.
+                        jdRepository.findById(jd.getId()).ifPresent(jobDescToUpdate -> {
+                            jobDescToUpdate.setRequiredExperience(requiredExp);
+                            jdRepository.save(jobDescToUpdate);
+                            // Step 2: Now proceed with matching employees using the updated JD.
+                            matchEmployeesAgainstJd(jobDescToUpdate, jdText);
+                        });
                     },
                     error -> {
-                        logger.error("Failed to extract experience from JD ID {}. Matching will proceed without this filter. Error: {}", jd.getId(), error.getMessage());
-                        // Fallback: Proceed with matching even if experience extraction fails.
+                        logger.error("Failed to extract experience from JD ID {}. Matching process will continue without this filter. Error: {}", jd.getId(), error.getMessage());
                         matchEmployeesAgainstJd(jd, jdText);
                     }
             );
@@ -71,19 +78,16 @@ public class MatchingService {
     }
 
     /**
-     * Finds potential candidates and runs them through the matching filters.
-     * @param jd The JobDescription entity, now with requiredExperience populated.
-     * @param jdText The full text of the job description.
+     * Private helper method to contain the core matching logic.
+     * It pre-filters candidates by experience and then calls the LLM for detailed analysis.
      */
     private void matchEmployeesAgainstJd(JobDescription jd, String jdText) {
-        // Find employees who are either AVAILABLE or will be available within 90 days.
         LocalDate availabilityThreshold = LocalDate.now().plusDays(90);
         List<EmployeeProfile> potentialCandidates = employeeRepository.findAvailableOrSoonToBeAvailable(availabilityThreshold);
 
-        logger.info("Found {} potential candidates (available or available soon) to match against.", potentialCandidates.size());
-
+        logger.info("Found {} potential candidates to match against.", potentialCandidates.size());
         if (potentialCandidates.isEmpty()) {
-            logger.warn("No potential candidates found. Matching process for JD ID {} will stop.", jd.getId());
+            logger.warn("No potential candidates found. Ending matching process for JD ID: {}", jd.getId());
             return;
         }
 
@@ -92,28 +96,26 @@ public class MatchingService {
         for (EmployeeProfile employee : potentialCandidates) {
             logger.info("Processing employee ID: {} - {}", employee.getUserId(), employee.getFullName());
 
-            // Step 3: Pre-filter by years of experience.
             Integer employeeExperience = employee.getYearsOfExperience() != null ? employee.getYearsOfExperience() : 0;
             if (employeeExperience < requiredExperience) {
                 logger.warn("Skipping employee ID: {} due to insufficient experience (Has: {}, Requires: {}).", employee.getUserId(), employeeExperience, requiredExperience);
-                continue; // Skip to the next employee
+                continue;
             }
 
-            if (employee.getResumeFilePath() == null || StringUtils.isEmpty(employee.getResumeFilePath())) {
+            if (employee.getResumeFilePath() == null) {
                 logger.warn("Skipping employee ID: {} because they have no resume file path.", employee.getUserId());
                 continue;
             }
 
-            // Step 4: For candidates who pass the filter, perform the full LLM resume scan.
             try (InputStream resumeStream = fileSystemStorageService.loadAsResource(employee.getResumeFilePath()).getInputStream()) {
                 String resumeText = parsingService.parse(resumeStream, getFileExtension(employee.getResumeFilePath()));
 
                 llmService.getMatchScore(jdText, resumeText).subscribe(
                         llmResponse -> {
-                            logger.info("LLM match score received for Employee ID: {}. Score: {}. Saving referral...", employee.getUserId(), llmResponse.score());
+                            logger.info("LLM successful for Employee ID: {}. Score: {}. Saving referral...", employee.getUserId(), llmResponse.score());
                             saveReferral(jd, employee, llmResponse);
                         },
-                        error -> logger.error("LLM API call for match score FAILED for Employee ID: {}. Reason: {}", employee.getUserId(), error.getMessage())
+                        error -> logger.error("LLM API call FAILED for Employee ID: {}. Reason: {}", employee.getUserId(), error.getMessage())
                 );
             } catch (Exception e) {
                 logger.error("Failed to process resume for Employee ID: {}. Skipping. Error: {}", employee.getUserId(), e.getMessage());
@@ -122,8 +124,8 @@ public class MatchingService {
     }
 
     /**
-     * Saves a new Referral record to the database. This runs in its own new
-     * transaction to ensure it can commit even when called from a reactive chain.
+     * Saves a new Referral record. Runs in its own new transaction to ensure
+     * it's independent of the main loop.
      */
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void saveReferral(JobDescription jd, EmployeeProfile employee, LLMResponse llmResponse) {
@@ -134,14 +136,16 @@ public class MatchingService {
         referral.setJustification(llmResponse.justification());
 
         if (llmResponse.matchingSkills() != null && !llmResponse.matchingSkills().isEmpty()) {
-            String skillsString = String.join(",", llmResponse.matchingSkills());
-            referral.setMatchingSkills(skillsString);
+            referral.setMatchingSkills(String.join(",", llmResponse.matchingSkills()));
         }
 
         referralRepository.save(referral);
         logger.info("SUCCESS: Referral saved for Employee ID {} and JD ID {}.", employee.getUserId(), jd.getId());
     }
 
+    /**
+     * Helper utility to safely get a file's extension.
+     */
     private String getFileExtension(String fileName) {
         if (fileName == null || fileName.isEmpty()) {
             return "";

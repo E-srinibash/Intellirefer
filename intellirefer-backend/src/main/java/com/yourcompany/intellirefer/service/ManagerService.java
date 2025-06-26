@@ -16,6 +16,8 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.multipart.MultipartFile;
+import org.springframework.context.ApplicationEventPublisher; // <-- Import this
+import com.yourcompany.intellirefer.event.JdUploadedEvent;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -44,6 +46,7 @@ public class ManagerService {
     // DTO Mapper for converting entities to DTOs
     @Autowired private DtoMapper dtoMapper;
 
+    @Autowired ApplicationEventPublisher eventPublisher;
     /**
      * Handles the upload of a new Job Description. It saves the file, creates a
      * DB record, and triggers the asynchronous matching process.
@@ -78,8 +81,8 @@ public class ManagerService {
         logger.info("Saved new Job Description with ID: {}", savedJd.getId());
 
         // Trigger the asynchronous background process to match this JD against available employees.
-        logger.info("Triggering asynchronous matching process for JD ID: {}", savedJd.getId());
-        matchingService.processJdMatching(savedJd.getId());
+        logger.info("Publishing JdUploadedEvent for JD ID: {}", savedJd.getId());
+        eventPublisher.publishEvent(new JdUploadedEvent(this, savedJd.getId()));
 
         // Return the DTO for the newly created JD immediately.
         // The user does not have to wait for the matching to complete.
